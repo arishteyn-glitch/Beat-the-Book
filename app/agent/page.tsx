@@ -1,503 +1,802 @@
 "use client";
 
-// ── AI Agent: quantitative bet analysis workbench ────────────────────
-// A deterministic scoring engine runs locally on every input. When an
-// ANTHROPIC_API_KEY is configured, Claude adds qualitative analysis on top.
+// ── AI Agent: chat with your resident betting analyst ─────────────────
+// Free-form conversation: ask for the best bet of the day, paste a
+// multi-leg parlay to get it scored, ask how to use a promo, or have it
+// review your results. Replies stream in; concrete recommendations
+// arrive as ```rec JSON blocks rendered into actionable cards.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "@/lib/store";
+import { groupBy, overallStats, round2 } from "@/lib/stats";
+import { fmtOdds, impliedProbability, totalPayout } from "@/lib/odds";
+import { fmtMoney, todayISO, uid } from "@/lib/utils";
 import {
-  AgentInput,
-  AgentResult,
-  analyzeBet,
-  SCORE_WEIGHTS,
-  SPORT_FRAMEWORKS,
-} from "@/lib/agent";
-import { overallStats } from "@/lib/stats";
-import { fmtOdds, impliedProbability } from "@/lib/odds";
-import {
+  AgentScores,
   BET_TYPES,
   MARKETS,
-  PROMO_TYPES,
-  Recommendation,
   SPORTS,
   SPORTSBOOKS,
+  type BetType,
+  type Market,
+  type Sport,
+  type Sportsbook,
 } from "@/lib/types";
-import { fmtMoney, fmtPct, uid } from "@/lib/utils";
+import { emptyBet } from "@/components/bets/bet-form";
 import {
   Badge,
   Button,
   Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-  Field,
-  Input,
   PageHeader,
-  ScoreBar,
-  Select,
-  Textarea,
   VerdictBadge,
 } from "@/components/ui/primitives";
-import { Bot, Save, Sparkles } from "lucide-react";
+import {
+  Bot,
+  Check,
+  ClipboardCheck,
+  RotateCcw,
+  Save,
+  Send,
+  Square,
+} from "lucide-react";
 
-const SITUATIONAL = [
-  ["restAdvantage", "Rest advantage"],
-  ["injuryEdge", "Injury edge not priced in"],
-  ["weatherEdge", "Weather favors this side"],
-  ["schedulingSpot", "Favorable schedule spot"],
-  ["motivationEdge", "Motivation edge"],
-  ["negativeSituation", "Spot works AGAINST this side"],
-] as const;
+const CHAT_KEY = "beat-the-book:agent-chat:v1";
 
-const SIGNALS = [
-  ["reverseLineMovement", "Reverse line movement"],
-  ["steamWithYou", "Steam move with you"],
-  ["steamAgainstYou", "Steam move against you"],
-  ["heavyPublicOnYou", "Heavy public on your side"],
-  ["bestPriceShopped", "Best price (line shopped)"],
-  ["lineStale", "Stale line vs consensus"],
-] as const;
+interface ChatMsg {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  streaming?: boolean;
+  status?: string | null;
+  error?: "no_api_key" | "generic" | null;
+}
 
-const RISKS = [
-  ["correlatedWithOpenBets", "Correlated with open bets"],
-  ["highVarianceMarket", "High-variance market"],
-  ["lowLiquidityMarket", "Low-liquidity market"],
-  ["liveBet", "Live bet"],
-] as const;
+type SavedMap = Record<string, { board?: boolean; bet?: boolean }>;
+
+const SUGGESTIONS = [
+  "What's the best bet of the day?",
+  "Find me a strong NBA player prop tonight",
+  "Score this parlay: Lakers ML + over 224.5, +260 on FanDuel, $20",
+  "Review my results — where am I leaking money?",
+  "I have a 30% profit boost (max $25) on FanDuel. Optimal use?",
+];
 
 export default function AgentPage() {
-  const { db, ready, upsertRecommendation } = useStore();
-  const [meta, setMeta] = useState({
-    sport: "NBA",
-    event: "",
-    sportsbook: db.settings.preferredSportsbook ?? "FanDuel",
-    market: "Spread",
-    betType: "Straight",
-    selection: "",
-    notes: "",
-  });
-  const [odds, setOdds] = useState(-110);
-  const [trueProbPct, setTrueProbPct] = useState(55);
-  const [promoType, setPromoType] = useState("None");
-  const [boostPct, setBoostPct] = useState(30);
-  const [flags, setFlags] = useState<Record<string, boolean>>({});
-  const [homework, setHomework] = useState(0.5);
-  const [result, setResult] = useState<AgentResult | null>(null);
-  const [aiNote, setAiNote] = useState<string | null>(null);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const { db, ready, upsertRecommendation, upsertBet } = useStore();
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [savedMap, setSavedMap] = useState<SavedMap>({});
+  const [input, setInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const taRef = useRef<HTMLTextAreaElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const stats = useMemo(
-    () => overallStats(db.bets, db.settings),
-    [db.bets, db.settings]
-  );
+  // Restore the conversation after reloads
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(CHAT_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed.messages)) setMessages(parsed.messages);
+        if (parsed.savedMap) setSavedMap(parsed.savedMap);
+      }
+    } catch {
+      // corrupt cache — start fresh
+    }
+    setLoaded(true);
+  }, []);
 
-  if (!ready) return null;
-  const cur = db.settings.currency;
-  const implied = impliedProbability(odds) * 100;
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(
+        CHAT_KEY,
+        JSON.stringify({
+          messages: messages.filter((m) => !m.streaming).slice(-60),
+          savedMap,
+        })
+      );
+    } catch {
+      // storage full — keep chatting in memory
+    }
+  }, [messages, savedMap, loaded]);
 
-  const buildInput = (): AgentInput => ({
-    odds,
-    estTrueProb: trueProbPct / 100,
-    promoType: promoType as AgentInput["promoType"],
-    promoBoostPct: boostPct,
-    situational: {
-      restAdvantage: !!flags.restAdvantage,
-      injuryEdge: !!flags.injuryEdge,
-      weatherEdge: !!flags.weatherEdge,
-      schedulingSpot: !!flags.schedulingSpot,
-      motivationEdge: !!flags.motivationEdge,
-      negativeSituation: !!flags.negativeSituation,
-    },
-    signals: {
-      reverseLineMovement: !!flags.reverseLineMovement,
-      steamWithYou: !!flags.steamWithYou,
-      steamAgainstYou: !!flags.steamAgainstYou,
-      heavyPublicOnYou: !!flags.heavyPublicOnYou,
-      bestPriceShopped: !!flags.bestPriceShopped,
-      lineStale: !!flags.lineStale,
-    },
-    riskFactors: {
-      correlatedWithOpenBets: !!flags.correlatedWithOpenBets,
-      highVarianceMarket: !!flags.highVarianceMarket,
-      lowLiquidityMarket: !!flags.lowLiquidityMarket,
-      liveBet: !!flags.liveBet,
-    },
-    dataCompleteness: homework,
-  });
+  // Keep the newest message in view
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages]);
 
-  const run = () => {
-    const r = analyzeBet(
-      buildInput(),
-      stats.currentBankroll,
-      db.settings.unitSize,
-      db.settings.riskTolerance
-    );
-    setResult(r);
-    setSaved(false);
-    setAiNote(null);
+  // Auto-grow the composer
+  useEffect(() => {
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+  }, [input]);
+
+  // Compact tracker snapshot so the analyst knows the user's situation
+  const buildContext = () => {
+    const s = overallStats(db.bets, db.settings);
+    const bySport = groupBy(db.bets, (b) => b.sport, db.settings.unitSize);
+    const st = db.settings;
+    return {
+      settings: {
+        currency: st.currency,
+        startingBankroll: st.startingBankroll,
+        unitSize: st.unitSize,
+        riskTolerance: st.riskTolerance,
+        preferredSportsbook: st.preferredSportsbook,
+        preferredSports: st.preferredSports,
+      },
+      bankroll: round2(s.currentBankroll),
+      record: `${s.wins}-${s.losses}-${s.pushes}`,
+      roiPct: round2(s.roi),
+      netProfit: round2(s.profit),
+      netUnits: round2(s.units),
+      avgClvPct: s.avgClv == null ? null : round2(s.avgClv),
+      openExposure: round2(s.openExposure),
+      sportPerformance: bySport.slice(0, 8).map((g) => ({
+        sport: g.key,
+        bets: g.bets,
+        profit: round2(g.profit),
+        roiPct: round2(g.roi),
+      })),
+      openBets: db.bets
+        .filter((b) => b.status === "pending")
+        .slice(0, 20)
+        .map((b) => ({
+          sport: b.sport,
+          event: b.event,
+          selection: b.selection,
+          odds: b.odds,
+          stake: b.stake,
+          sportsbook: b.sportsbook,
+          betType: b.betType,
+        })),
+      activePromotions: db.promotions
+        .filter((p) => p.status === "active")
+        .slice(0, 10)
+        .map((p) => ({
+          sportsbook: p.sportsbook,
+          type: p.promoType,
+          description: p.description,
+          boostPct: p.boostPct,
+          maxStake: p.maxStake,
+          minOdds: p.minOdds,
+          expiration: p.expiration,
+        })),
+    };
   };
 
-  const runWithClaude = async () => {
-    run();
-    setAiLoading(true);
+  const send = async (text: string) => {
+    const q = text.trim();
+    if (!q || busy) return;
+    setInput("");
+    const userMsg: ChatMsg = { id: uid(), role: "user", content: q };
+    const asstId = uid();
+    const history = [...messages, userMsg];
+    setMessages([
+      ...history,
+      { id: asstId, role: "assistant", content: "", streaming: true, status: "Thinking…" },
+    ]);
+    setBusy(true);
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    const patch = (fn: (m: ChatMsg) => ChatMsg) =>
+      setMessages((cur) => cur.map((m) => (m.id === asstId ? fn(m) : m)));
+
     try {
       const res = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: ac.signal,
         body: JSON.stringify({
-          ...meta,
-          odds,
-          estTrueProbPct: trueProbPct,
-          promoType,
-          flags,
+          messages: history.slice(-24).map((m) => ({ role: m.role, content: m.content })),
+          context: buildContext(),
         }),
       });
-      const data = await res.json();
-      setAiNote(
-        res.ok && data.analysis
-          ? data.analysis
-          : data.error ?? "AI analysis unavailable."
-      );
-    } catch {
-      setAiNote("AI analysis unavailable (network error).");
+
+      if (!res.ok || !res.body) {
+        let err = "The analyst is unavailable right now. Try again in a moment.";
+        let code: ChatMsg["error"] = "generic";
+        try {
+          const data = await res.json();
+          if (data?.error) err = data.error;
+          if (data?.code === "no_api_key") code = "no_api_key";
+        } catch {
+          // non-JSON error body
+        }
+        patch((m) => ({ ...m, streaming: false, status: null, error: code, content: err }));
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let ev: any;
+          try {
+            ev = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (ev.t === "delta")
+            patch((m) => ({ ...m, content: m.content + ev.v, status: null }));
+          else if (ev.t === "status") patch((m) => ({ ...m, status: ev.v }));
+          else if (ev.t === "error")
+            patch((m) => ({
+              ...m,
+              streaming: false,
+              status: null,
+              error: m.content ? null : "generic",
+              content: m.content || ev.v,
+            }));
+        }
+      }
+      patch((m) => ({
+        ...m,
+        streaming: false,
+        status: null,
+        content: m.content || "No response came back — try again.",
+      }));
+    } catch (e: any) {
+      if (e?.name === "AbortError")
+        patch((m) => ({
+          ...m,
+          streaming: false,
+          status: null,
+          content: (m.content || "").trimEnd() + "\n\n*(stopped)*",
+        }));
+      else
+        patch((m) => ({
+          ...m,
+          streaming: false,
+          status: null,
+          error: "generic",
+          content: "Network error — is the dev server still running?",
+        }));
     } finally {
-      setAiLoading(false);
+      setBusy(false);
+      abortRef.current = null;
     }
   };
 
-  const saveToBoard = () => {
-    if (!result) return;
-    const rec: Recommendation = {
-      id: uid(),
-      createdAt: new Date().toISOString(),
-      sport: meta.sport as Recommendation["sport"],
-      event: meta.event || "(event not specified)",
-      sportsbook: meta.sportsbook as Recommendation["sportsbook"],
-      market: meta.market as Recommendation["market"],
-      betType: meta.betType as Recommendation["betType"],
-      selection: meta.selection || meta.market,
-      odds,
-      scores: result.scores,
-      finalScore: result.finalScore,
-      verdict: result.verdict,
-      stakeRec: result.stakeRec,
-      unitsRec: result.unitsRec,
-      estTrueProb: trueProbPct / 100,
-      impliedProb: result.impliedProb,
-      edgePct: result.edgePct,
-      evPct: result.evPct,
-      clvProjection: result.clvProjection,
-      factors: result.factors,
-      risks: result.risks,
-      summary: aiNote?.slice(0, 400) ?? meta.notes,
-      status: "active",
-    };
-    upsertRecommendation(rec);
-    setSaved(true);
+  const stop = () => abortRef.current?.abort();
+
+  const newChat = () => {
+    if (busy) return;
+    setMessages([]);
+    setSavedMap({});
+    try {
+      localStorage.removeItem(CHAT_KEY);
+    } catch {
+      // ignore
+    }
   };
 
-  const toggle = (k: string) => setFlags((f) => ({ ...f, [k]: !f[k] }));
+  const saveToBoard = (key: string, r: ParsedRec) => {
+    upsertRecommendation({
+      id: uid(),
+      createdAt: new Date().toISOString(),
+      sport: r.sport,
+      event: r.event || "(event not specified)",
+      sportsbook: r.sportsbook,
+      market: r.market,
+      betType: r.betType,
+      selection: r.selection,
+      odds: r.odds,
+      scores: r.scores,
+      finalScore: r.finalScore,
+      verdict: r.verdict,
+      stakeRec: r.stakeRec,
+      unitsRec: r.unitsRec,
+      estTrueProb: r.estTrueProb,
+      impliedProb: Math.round(impliedProbability(r.odds) * 1000) / 10,
+      edgePct: r.edgePct,
+      evPct: r.evPct,
+      clvProjection: r.clvProjection,
+      factors: r.factors,
+      risks: r.risks,
+      summary: r.summary,
+      status: "active",
+    });
+    setSavedMap((s) => ({ ...s, [key]: { ...s[key], board: true } }));
+  };
+
+  const logAsBet = (key: string, r: ParsedRec) => {
+    const stake = r.stakeRec > 0 ? r.stakeRec : db.settings.unitSize;
+    upsertBet(
+      emptyBet({
+        date: todayISO(),
+        sport: r.sport,
+        event: r.event,
+        sportsbook: r.sportsbook,
+        betType: r.betType,
+        market: r.market,
+        selection: r.legs.length > 1 ? r.legs.join(" + ") : r.selection,
+        odds: r.odds,
+        stake,
+        potentialPayout: Math.round(totalPayout(r.odds, stake) * 100) / 100,
+        estTrueProb: r.estTrueProb || null,
+        confidenceScore: r.scores.confidence,
+        finalBetScore: r.finalScore,
+        notes: `From AI Agent chat (score ${r.finalScore}). ${r.summary}`.trim(),
+      })
+    );
+    setSavedMap((s) => ({ ...s, [key]: { ...s[key], bet: true } }));
+  };
+
+  if (!ready) return null;
+  const cur = db.settings.currency;
 
   return (
-    <div>
+    <div className="flex h-[calc(100dvh-150px)] min-h-[440px] flex-col md:h-[calc(100dvh-130px)]">
       <PageHeader
         title="AI Agent"
-        sub="Professional bettor + quant analyst + risk manager. No hot takes — just process."
+        sub="Your betting analyst — ask anything: best bets today, parlay scoring, promo strategy, performance review."
+        actions={
+          <Button variant="outline" size="sm" onClick={newChat} disabled={busy || messages.length === 0}>
+            <RotateCcw size={13} /> New chat
+          </Button>
+        }
       />
 
-      <div className="grid gap-5 xl:grid-cols-5">
-        {/* Input column */}
-        <Card className="xl:col-span-2">
-          <CardHeader>
-            <CardTitle>Bet under evaluation</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Sport">
-                <Select
-                  value={meta.sport}
-                  onChange={(e) => setMeta({ ...meta, sport: e.target.value })}
-                >
-                  {SPORTS.map((s) => <option key={s}>{s}</option>)}
-                </Select>
-              </Field>
-              <Field label="Sportsbook">
-                <Select
-                  value={meta.sportsbook}
-                  onChange={(e) => setMeta({ ...meta, sportsbook: e.target.value as any })}
-                >
-                  {SPORTSBOOKS.map((s) => <option key={s}>{s}</option>)}
-                </Select>
-              </Field>
-            </div>
-            <Field label="Event">
-              <Input
-                placeholder="Thunder @ Pacers"
-                value={meta.event}
-                onChange={(e) => setMeta({ ...meta, event: e.target.value })}
-              />
-            </Field>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Market">
-                <Select
-                  value={meta.market}
-                  onChange={(e) => setMeta({ ...meta, market: e.target.value })}
-                >
-                  {MARKETS.map((s) => <option key={s}>{s}</option>)}
-                </Select>
-              </Field>
-              <Field label="Bet type">
-                <Select
-                  value={meta.betType}
-                  onChange={(e) => setMeta({ ...meta, betType: e.target.value })}
-                >
-                  {BET_TYPES.map((s) => <option key={s}>{s}</option>)}
-                </Select>
-              </Field>
-            </div>
-            <Field label="Selection">
-              <Input
-                placeholder="Pacers +6.5"
-                value={meta.selection}
-                onChange={(e) => setMeta({ ...meta, selection: e.target.value })}
-              />
-            </Field>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Odds (American)">
-                <Input
-                  type="number"
-                  value={odds || ""}
-                  onChange={(e) => setOdds(+e.target.value || 0)}
-                />
-              </Field>
-              <Field label={`Your est. win % (implied ${implied.toFixed(1)}%)`}>
-                <Input
-                  type="number"
-                  step="0.5"
-                  value={trueProbPct}
-                  onChange={(e) => setTrueProbPct(+e.target.value || 0)}
-                />
-              </Field>
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Promotion applied">
-                <Select value={promoType} onChange={(e) => setPromoType(e.target.value)}>
-                  {PROMO_TYPES.map((s) => <option key={s}>{s}</option>)}
-                </Select>
-              </Field>
-              {(promoType.includes("Boost")) && (
-                <Field label="Boost %">
-                  <Input
-                    type="number"
-                    value={boostPct}
-                    onChange={(e) => setBoostPct(+e.target.value || 0)}
-                  />
-                </Field>
-              )}
-            </div>
-
-            <FlagGroup title="Situational factors" items={SITUATIONAL} flags={flags} toggle={toggle} />
-            <FlagGroup title="Market intelligence" items={SIGNALS} flags={flags} toggle={toggle} />
-            <FlagGroup title="Risk factors" items={RISKS} flags={flags} toggle={toggle} />
-
-            <Field label={`Homework done: ${Math.round(homework * 100)}% of the ${meta.sport} checklist`}>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.1}
-                value={homework}
-                onChange={(e) => setHomework(+e.target.value)}
-                className="w-full accent-blue-500"
-              />
-            </Field>
-
-            <div className="flex gap-2 pt-1">
-              <Button onClick={run} className="flex-1">
-                <Bot size={15} /> Score this bet
-              </Button>
-              <Button variant="outline" onClick={runWithClaude} disabled={aiLoading}>
-                <Sparkles size={15} />
-                {aiLoading ? "Thinking…" : "+ Claude analysis"}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Result column */}
-        <div className="space-y-5 xl:col-span-3">
-          {!result ? (
-            <Card className="flex min-h-[300px] items-center justify-center p-8 text-center">
-              <div>
-                <Bot className="mx-auto mb-3 text-muted" size=
-{28} />
-                <p className="text-sm font-medium text-zinc-300">
-                  Enter a bet and run the scoring engine.
-                </p>
-                <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-muted">
-                  Seven dimensions are scored 1–10 and blended into a Final Bet
-                  Score (1–100). EV matters here — but so do CLV projection,
-                  situational spots, sharp-money signals, promotion value, and
-                  portfolio risk. Below 60 we pass. No forced picks.
-                </p>
+      <Card className="flex min-h-0 flex-1 flex-col">
+        {/* Message thread */}
+        <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-4">
+          {messages.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center p-4 text-center">
+              <Bot size={30} className="mb-3 text-blue-400" />
+              <h2 className="text-sm font-semibold text-zinc-100">
+                Talk to your betting analyst
+              </h2>
+              <p className="mt-2 max-w-md text-xs leading-relaxed text-muted">
+                Ask for the best bets today, paste a parlay (any number of legs)
+                to get it scored 1–100, ask how to use a promo, or have it review
+                your results. It knows your bankroll, open bets, and active
+                promotions — and it will say PASS when nothing clears the bar.
+              </p>
+              <div className="mt-4 flex max-w-xl flex-wrap justify-center gap-2">
+                {SUGGESTIONS.map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => send(s)}
+                    className="rounded-lg border border-border bg-panel-2 px-3 py-1.5 text-[12px] text-zinc-300 transition-colors hover:border-accent/50 hover:text-blue-400"
+                  >
+                    {s}
+                  </button>
+                ))}
               </div>
-            </Card>
+            </div>
           ) : (
-            <>
-              <Card>
-                <CardContent className="p-5">
-                  <div className="flex flex-wrap items-center justify-between gap-4">
-                    <div>
-                      <div className="text-xs uppercase tracking-wider text-muted">
-                        {meta.selection || "Unnamed selection"} · {fmtOdds(odds)} ·{" "}
-                        {meta.sportsbook}
-                      </div>
-                      <div className="mt-1 flex items-center gap-3">
-                        <span className="font-mono text-4xl font-black tabular-nums text-zinc-50">
-                          {result.finalScore}
-                        </span>
-                        <div>
-                          <VerdictBadge verdict={result.verdict} />
-                          <div className="mt-1 text-xs font-medium text-muted">
-                            {result.rating}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-xs md:grid-cols-3">
-                      <Kv k="Est. true prob" v={`${trueProbPct.toFixed(1)}%`} />
-                      <Kv k="Implied prob" v={`${result.impliedProb}%`} />
-                      <Kv k="Edge" v={fmtPct(result.edgePct, { sign: true })} good={result.edgePct > 0} />
-                      <Kv k="EV" v={fmtPct(result.evPct, { sign: true })} good={result.evPct > 0} />
-                      <Kv k="CLV projection" v={fmtPct(result.clvProjection, { sign: true })} good={result.clvProjection > 0} />
-                      <Kv
-                        k="Stake rec"
-                        v={
-                          result.stakeRec > 0
-                            ? `${fmtMoney(result.stakeRec, cur)} (${result.unitsRec}u)`
-                            : "No bet"
-                        }
-                      />
+            <div className="space-y-4">
+              {messages.map((m) =>
+                m.role === "user" ? (
+                  <div key={m.id} className="flex justify-end">
+                    <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm border border-accent/25 bg-accent/15 px-3.5 py-2.5 text-[13px] leading-relaxed text-zinc-100">
+                      {m.content}
                     </div>
                   </div>
-                </CardContent>
-              </Card>
-
-              <div className="grid gap-5 md:grid-cols-2">
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Score breakdown</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-3">
-                    <ScoreBar label={`Statistical edge (${pct(SCORE_WEIGHTS.statisticalEdge)})`} value={result.scores.statisticalEdge} />
-                    <ScoreBar label={`Market value (${pct(SCORE_WEIGHTS.marketValue)})`} value={result.scores.marketValue} />
-                    <ScoreBar label={`Situational edge (${pct(SCORE_WEIGHTS.situationalEdge)})`} value={result.scores.situationalEdge} />
-                    <ScoreBar label={`Market intelligence (${pct(SCORE_WEIGHTS.marketIntelligence)})`} value={result.scores.marketIntelligence} />
-                    <ScoreBar label={`Risk — lower is better (${pct(SCORE_WEIGHTS.riskSafety)})`} value={result.scores.risk} invert />
-                    <ScoreBar label={`Promotion value (${pct(SCORE_WEIGHTS.promotionValue)})`} value={result.scores.promotionValue} />
-                    <ScoreBar label={`Confidence (${pct(SCORE_WEIGHTS.confidence)})`} value={result.scores.confidence} />
-                  </CardContent>
-                </Card>
-
-                <Card>
-                  <CardHeader>
-                    <CardTitle>Factors & risks</CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-3 text-[13px]">
-                    <div>
-                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-profit">
-                        Supporting factors
-                      </div>
-                      {result.factors.length === 0 && (
-                        <p className="text-xs text-muted">None identified.</p>
-                      )}
-                      <ul className="space-y-1">
-                        {result.factors.map((f, i) => (
-                          <li key={i} className="flex gap-2 text-zinc-300">
-                            <span className="text-profit">+</span> {f}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div>
-                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-loss">
-                        Key risks
-                      </div>
-                      {result.risks.length === 0 && (
-                        <p className="text-xs text-muted">None identified.</p>
-                      )}
-                      <ul className="space-y-1">
-                        {result.risks.map((r, i) => (
-                          <li key={i} className="flex gap-2 text-zinc-300">
-                            <span className="text-loss">–</span> {r}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  </CardContent>
-                </Card>
-              </div>
-
-              {aiNote && (
-                <Card className="border-violet/30">
-                  <CardHeader>
-                    <CardTitle className="text-violet">Claude analysis</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-zinc-300">
-                      {aiNote}
-                    </p>
-                  </CardContent>
-                </Card>
+                ) : (
+                  <AssistantMessage
+                    key={m.id}
+                    msg={m}
+                    cur={cur}
+                    savedMap={savedMap}
+                    onBoard={saveToBoard}
+                    onBet={logAsBet}
+                  />
+                )
               )}
-
-              <div className="flex items-center gap-2">
-                <Button onClick={saveToBoard} disabled={saved} variant="success">
-                  <Save size={15} />
-                  {saved ? "Saved to Picks Board" : "Save to Picks Board"}
-                </Button>
-                {result.verdict === "PASS" && (
-                  <span className="text-xs text-muted">
-                    Passing is a result too — protecting bankroll IS the edge.
-                  </span>
-                )}
-              </div>
-            </>
+            </div>
           )}
-
-          {/* Sport framework checklist */}
-          <Card>
-            <CardHeader>
-              <CardTitle>{meta.sport} analysis framework</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <ul className="grid gap-1.5 text-[13px] text-zinc-300 md:grid-cols-2">
-                {(SPORT_FRAMEWORKS[meta.sport] ?? SPORT_FRAMEWORKS.Other).map(
-                  (item, i) => (
-                    <li key={i} className="flex gap-2">
-                      <span className="text-blue-400">▸</span> {item}
-                    </li>
-                  )
-                )}
-              </ul>
-            </CardContent>
-          </Card>
         </div>
+
+        {/* Composer */}
+        <div className="border-t border-border p-3">
+          <div className="flex items-end gap-2">
+            <textarea
+              ref={taRef}
+              rows={1}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send(input);
+                }
+              }}
+              placeholder='Ask anything — "best NBA bet tonight?", "score this 4-leg parlay: …"'
+              className="max-h-40 min-h-[42px] w-full resize-none rounded-lg border border-border bg-panel-2 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-muted/60 focus:border-accent/60 focus:outline-none focus:ring-1 focus:ring-accent/40"
+            />
+            {busy ? (
+              <Button variant="outline" onClick={stop} title="Stop" className="shrink-0">
+                <Square size={14} /> Stop
+              </Button>
+            ) : (
+              <Button
+                onClick={() => send(input)}
+                disabled={!input.trim()}
+                title="Send (Enter)"
+                className="shrink-0"
+              >
+                <Send size={14} />
+              </Button>
+            )}
+          </div>
+          <p className="mt-1.5 text-[10.5px] text-muted">
+            Enter to send · Shift+Enter for a new line · Lines move — always
+            verify the live price at your book before betting.
+          </p>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+// ── Assistant message: markdown + rec cards ───────────────────────────
+
+function AssistantMessage({
+  msg,
+  cur,
+  savedMap,
+  onBoard,
+  onBet,
+}: {
+  msg: ChatMsg;
+  cur: string;
+  savedMap: SavedMap;
+  onBoard: (key: string, r: ParsedRec) => void;
+  onBet: (key: string, r: ParsedRec) => void;
+}) {
+  const segs = useMemo(
+    () => splitSegments(msg.content, !!msg.streaming),
+    [msg.content, msg.streaming]
+  );
+  return (
+    <div className="flex gap-2.5">
+      <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-accent/30 bg-accent/10">
+        <Bot size={14} className="text-blue-400" />
+      </div>
+      <div className="min-w-0 max-w-[92%] flex-1 text-[13px] text-zinc-300">
+        {msg.error === "no_api_key" ? (
+          <SetupCard />
+        ) : (
+          <>
+            {segs.map((seg, i) => {
+              if (seg.kind === "text") return <MarkdownBlocks key={i} text={seg.text} />;
+              if (seg.kind === "drafting")
+                return (
+                  <div
+                    key={i}
+                    className="my-2 animate-pulse rounded-xl border border-dashed border-accent/30 bg-panel-2/50 p-3 text-xs text-muted"
+                  >
+                    Building bet card…
+                  </div>
+                );
+              const key = `${msg.id}:${i}`;
+              return (
+                <RecCard
+                  key={i}
+                  rec={seg.rec}
+                  raw={seg.raw}
+                  cur={cur}
+                  saved={savedMap[key] ?? {}}
+                  onBoard={() => seg.rec && onBoard(key, seg.rec)}
+                  onBet={() => seg.rec && onBet(key, seg.rec)}
+                />
+              );
+            })}
+            {msg.error === "generic" && segs.length === 0 && (
+              <p className="text-loss">{msg.content}</p>
+            )}
+          </>
+        )}
+        {msg.status && (
+          <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-400" />
+            {msg.status}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-function pct(n: number) {
-  return `${Math.round(n * 100)}%`;
+function SetupCard() {
+  return (
+    <div className="rounded-xl border border-warn/30 bg-warn/8 p-4">
+      <div className="mb-1.5 text-[13px] font-semibold text-warn">
+        One-time setup needed
+      </div>
+      <p className="mb-2 text-xs leading-relaxed text-zinc-300">
+        The chat is powered by Claude, which needs an API key (a password that
+        lets this app talk to the AI). Three steps:
+      </p>
+      <ol className="ml-4 list-decimal space-y-1.5 text-xs leading-relaxed text-zinc-300">
+        <li>
+          Get a key at{" "}
+          <a
+            href="https://console.anthropic.com"
+            target="_blank"
+            rel="noreferrer"
+            className="text-blue-400 underline"
+          >
+            console.anthropic.com
+          </a>{" "}
+          (sign up → Settings → API Keys → Create Key).
+        </li>
+        <li>
+          In the project folder, create a file named{" "}
+          <code className="rounded bg-white/8 px-1 font-mono text-[11px]">.env.local</code>{" "}
+          containing one line:{" "}
+          <code className="rounded bg-white/8 px-1 font-mono text-[11px]">
+            ANTHROPIC_API_KEY=your-key-here
+          </code>
+        </li>
+        <li>
+          Restart the dev server (stop it with Ctrl+C, then run{" "}
+          <code className="rounded bg-white/8 px-1 font-mono text-[11px]">npm run dev</code>{" "}
+          again).
+        </li>
+      </ol>
+    </div>
+  );
 }
 
-function Kv({ k, v, good }: { k: string; v: string; good?: boolean }) {
+// ── Rec block parsing ─────────────────────────────────────────────────
+
+interface ParsedRec {
+  sport: Sport;
+  event: string;
+  sportsbook: Sportsbook;
+  market: Market;
+  betType: BetType;
+  selection: string;
+  legs: string[];
+  odds: number;
+  estTrueProb: number;
+  scores: AgentScores;
+  finalScore: number;
+  verdict: "BET" | "LEAN" | "PASS";
+  stakeRec: number;
+  unitsRec: number;
+  edgePct: number;
+  evPct: number;
+  clvProjection: number;
+  factors: string[];
+  risks: string[];
+  summary: string;
+}
+
+type Segment =
+  | { kind: "text"; text: string }
+  | { kind: "rec"; rec: ParsedRec | null; raw: string }
+  | { kind: "drafting" };
+
+function splitSegments(content: string, streaming: boolean): Segment[] {
+  const out: Segment[] = [];
+  const re = /```rec\s*\n?([\s\S]*?)```/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content))) {
+    if (m.index > last) out.push({ kind: "text", text: content.slice(last, m.index) });
+    out.push({ kind: "rec", rec: normalizeRec(m[1]), raw: m[1] });
+    last = m.index + m[0].length;
+  }
+  const tail = content.slice(last);
+  const open = tail.indexOf("```rec");
+  if (open >= 0) {
+    if (tail.slice(0, open).trim()) out.push({ kind: "text", text: tail.slice(0, open) });
+    if (streaming) out.push({ kind: "drafting" });
+    else out.push({ kind: "text", text: tail.slice(open) });
+  } else if (tail.trim()) {
+    out.push({ kind: "text", text: tail });
+  }
+  return out;
+}
+
+function normalizeRec(jsonText: string): ParsedRec | null {
+  let raw: any;
+  try {
+    raw = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== "object") return null;
+  const num = (v: any, d = 0) => (isFinite(Number(v)) ? Number(v) : d);
+  const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+  const odds = Math.round(num(raw.odds));
+  if (!odds) return null;
+  const s10 = (v: any) => clamp(num(v, 5), 1, 10);
+  let p = num(raw.estTrueProb);
+  if (p > 1) p = p / 100; // tolerate percentages
+  const finalScore = clamp(Math.round(num(raw.finalScore, 50)), 1, 100);
+  const strArr = (v: any) =>
+    Array.isArray(v) ? v.filter((x) => typeof x === "string").slice(0, 8) : [];
+  return {
+    sport: SPORTS.includes(raw.sport) ? raw.sport : "Other",
+    event: typeof raw.event === "string" ? raw.event : "",
+    sportsbook: SPORTSBOOKS.includes(raw.sportsbook) ? raw.sportsbook : "Other",
+    market: MARKETS.includes(raw.market) ? raw.market : "Other",
+    betType: BET_TYPES.includes(raw.betType) ? raw.betType : "Straight",
+    selection:
+      typeof raw.selection === "string" && raw.selection ? raw.selection : "Recommended bet",
+    legs: strArr(raw.legs),
+    odds,
+    estTrueProb: clamp(p, 0, 1),
+    scores: {
+      statisticalEdge: s10(raw.scores?.statisticalEdge),
+      marketValue: s10(raw.scores?.marketValue),
+      situationalEdge: s10(raw.scores?.situationalEdge),
+      marketIntelligence: s10(raw.scores?.marketIntelligence),
+      risk: s10(raw.scores?.risk),
+      promotionValue: s10(raw.scores?.promotionValue),
+      confidence: s10(raw.scores?.confidence),
+    },
+    finalScore,
+    verdict:
+      raw.verdict === "BET" || raw.verdict === "LEAN" || raw.verdict === "PASS"
+        ? raw.verdict
+        : finalScore >= 70
+          ? "BET"
+          : finalScore >= 60
+            ? "LEAN"
+            : "PASS",
+    stakeRec: Math.max(0, num(raw.stakeRec)),
+    unitsRec: Math.max(0, num(raw.unitsRec)),
+    edgePct: num(raw.edgePct),
+    evPct: num(raw.evPct),
+    clvProjection: num(raw.clvProjection),
+    factors: strArr(raw.factors),
+    risks: strArr(raw.risks),
+    summary: typeof raw.summary === "string" ? raw.summary : "",
+  };
+}
+
+// ── Rec card ──────────────────────────────────────────────────────────
+
+function RecCard({
+  rec,
+  raw,
+  cur,
+  saved,
+  onBoard,
+  onBet,
+}: {
+  rec: ParsedRec | null;
+  raw: string;
+  cur: string;
+  saved: { board?: boolean; bet?: boolean };
+  onBoard: () => void;
+  onBet: () => void;
+}) {
+  if (!rec)
+    return (
+      <pre className="my-2 overflow-x-auto rounded-lg bg-black/30 p-3 font-mono text-[11px] text-zinc-400">
+        {raw.trim()}
+      </pre>
+    );
+  const scoreColor =
+    rec.finalScore >= 80
+      ? "text-profit"
+      : rec.finalScore >= 70
+        ? "text-blue-400"
+        : rec.finalScore >= 60
+          ? "text-warn"
+          : "text-muted";
+  const sign = (n: number) => `${n >= 0 ? "+" : ""}${n.toFixed(1)}%`;
   return (
-    <div className="flex items-baseline justify-between gap-2 md:block">
-      <span className="text-muted">{k}</span>
+    <div className="my-2.5 rounded-xl border border-accent/25 bg-panel-2/70 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={`font-mono text-2xl font-black tabular-nums ${scoreColor}`}>
+              {rec.finalScore}
+            </span>
+            <VerdictBadge verdict={rec.verdict} />
+            <Badge variant="muted">{rec.sport}</Badge>
+            <Badge variant="muted">{rec.sportsbook}</Badge>
+          </div>
+          <div className="mt-1.5 text-sm font-semibold text-zinc-100">{rec.selection}</div>
+          {rec.event && <div className="text-xs text-muted">{rec.event}</div>}
+          {rec.legs.length > 1 && (
+            <ul className="mt-1.5 space-y-0.5">
+              {rec.legs.map((l, i) => (
+                <li key={i} className="flex gap-1.5 text-xs text-zinc-300">
+                  <span className="font-mono text-blue-400">{i + 1}.</span> {l}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="text-right">
+          <div className="font-mono text-xl font-bold tabular-nums text-zinc-100">
+            {fmtOdds(rec.odds)}
+          </div>
+          <div className="text-[11px] text-muted">
+            {rec.market} · {rec.betType}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-4">
+        <RecKv k="Est. win prob" v={`${(rec.estTrueProb * 100).toFixed(1)}%`} />
+        <RecKv k="Edge" v={sign(rec.edgePct)} good={rec.edgePct > 0} />
+        <RecKv k="EV" v={sign(rec.evPct)} good={rec.evPct > 0} />
+        <RecKv
+          k="Stake rec"
+          v={rec.stakeRec > 0 ? `${fmtMoney(rec.stakeRec, cur)} (${rec.unitsRec}u)` : "No bet"}
+        />
+      </div>
+
+      {(rec.factors.length > 0 || rec.risks.length > 0) && (
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          {rec.factors.length > 0 && (
+            <ul className="space-y-1">
+              {rec.factors.slice(0, 4).map((f, i) => (
+                <li key={i} className="flex gap-1.5 text-[11.5px] leading-snug text-zinc-300">
+                  <span className="shrink-0 text-profit">+</span> {f}
+                </li>
+              ))}
+            </ul>
+          )}
+          {rec.risks.length > 0 && (
+            <ul className="space-y-1">
+              {rec.risks.slice(0, 4).map((r, i) => (
+                <li key={i} className="flex gap-1.5 text-[11.5px] leading-snug text-zinc-300">
+                  <span className="shrink-0 text-loss">–</span> {r}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {rec.summary && <p className="mt-2.5 text-xs italic text-muted">{rec.summary}</p>}
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button size="sm" onClick={onBoard} disabled={!!saved.board}>
+          {saved.board ? (
+            <>
+              <Check size={13} /> On Picks Board
+            </>
+          ) : (
+            <>
+              <Save size={13} /> Save to Picks Board
+            </>
+          )}
+        </Button>
+        <Button size="sm" variant="success" onClick={onBet} disabled={!!saved.bet}>
+          {saved.bet ? (
+            <>
+              <Check size={13} /> Logged in Tracker
+            </>
+          ) : (
+            <>
+              <ClipboardCheck size={13} /> I placed this — log it
+            </>
+          )}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function RecKv({ k, v, good }: { k: string; v: string; good?: boolean }) {
+  return (
+    <div>
+      <div className="text-[10.5px] uppercase tracking-wider text-muted">{k}</div>
       <div
         className={`font-mono font-bold tabular-nums ${
           good == null ? "text-zinc-200" : good ? "text-profit" : "text-loss"
@@ -509,35 +808,119 @@ function Kv({ k, v, good }: { k: string; v: string; good?: boolean }) {
   );
 }
 
-function FlagGroup({
-  title,
-  items,
-  flags,
-  toggle,
-}: {
-  title: string;
-  items: readonly (readonly [string, string])[];
-  flags: Record<string, boolean>;
-  toggle: (k: string) => void;
-}) {
-  return (
-    <div>
-      <div className="mb-1.5 text-xs font-medium text-muted">{title}</div>
-      <div className="flex flex-wrap gap-1.5">
-        {items.map(([key, label]) => (
-          <button
-            key={key}
-            onClick={() => toggle(key)}
-            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-              flags[key]
-                ? "border-accent/50 bg-accent/15 text-blue-400"
-                : "border-border bg-panel-2 text-muted hover:text-zinc-300"
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
+// ── Tiny markdown renderer (bold, code, lists, headings, tables) ──────
+
+function MarkdownBlocks({ text }: { text: string }) {
+  const lines = text.split("\n");
+  const out: React.ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+    if (line.startsWith("```")) {
+      const buf: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) buf.push(lines[i++]);
+      i++; // closing fence
+      out.push(
+        <pre
+          key={key++}
+          className="my-2 overflow-x-auto rounded-lg bg-black/30 p-3 font-mono text-[12px] leading-relaxed text-zinc-300"
+        >
+          {buf.join("\n")}
+        </pre>
+      );
+      continue;
+    }
+    if (/^#{1,4}\s/.test(line)) {
+      out.push(
+        <div key={key++} className="mb-1 mt-3 text-[13px] font-bold text-zinc-100">
+          <Inline s={line.replace(/^#{1,4}\s/, "")} />
+        </div>
+      );
+      i++;
+      continue;
+    }
+    if (/^(-{3,}|\*{3,})\s*$/.test(line)) {
+      out.push(<hr key={key++} className="my-3 border-border" />);
+      i++;
+      continue;
+    }
+    if (/^\s*([-*•]|\d+[.)])\s/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*([-*•]|\d+[.)])\s/.test(lines[i]))
+        items.push(lines[i++].replace(/^\s*([-*•]|\d+[.)])\s/, ""));
+      out.push(
+        <ul key={key++} className="my-1.5 space-y-1 pl-1">
+          {items.map((it, j) => (
+            <li key={j} className="flex gap-2">
+              <span className="mt-[1px] shrink-0 text-blue-400">▸</span>
+              <span>
+                <Inline s={it} />
+              </span>
+            </li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+    if (line.trimStart().startsWith("|")) {
+      const rows: string[] = [];
+      while (i < lines.length && lines[i].trimStart().startsWith("|")) rows.push(lines[i++]);
+      out.push(
+        <pre
+          key={key++}
+          className="my-2 overflow-x-auto rounded-lg bg-black/30 p-3 font-mono text-[11.5px] leading-relaxed text-zinc-300"
+        >
+          {rows.join("\n")}
+        </pre>
+      );
+      continue;
+    }
+    const buf: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^(#{1,4}\s|```|-{3,}\s*$|\s*([-*•]|\d+[.)])\s)/.test(lines[i]) &&
+      !lines[i].trimStart().startsWith("|")
+    )
+      buf.push(lines[i++]);
+    out.push(
+      <p key={key++} className="my-1.5 leading-relaxed">
+        <Inline s={buf.join(" ")} />
+      </p>
+    );
+  }
+  return <>{out}</>;
+}
+
+function Inline({ s }: { s: string }) {
+  const parts: React.ReactNode[] = [];
+  const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*\s][^*]*\*)/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s))) {
+    if (m.index > last) parts.push(s.slice(last, m.index));
+    const tok = m[0];
+    if (tok.startsWith("**"))
+      parts.push(
+        <strong key={m.index} className="font-semibold text-zinc-100">
+          {tok.slice(2, -2)}
+        </strong>
+      );
+    else if (tok.startsWith("`"))
+      parts.push(
+        <code key={m.index} className="rounded bg-white/8 px-1 font-mono text-[12px]">
+          {tok.slice(1, -1)}
+        </code>
+      );
+    else parts.push(<em key={m.index}>{tok.slice(1, -1)}</em>);
+    last = m.index + tok.length;
+  }
+  if (last < s.length) parts.push(s.slice(last));
+  return <>{parts}</>;
 }
