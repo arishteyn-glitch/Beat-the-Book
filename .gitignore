@@ -22,6 +22,18 @@ npm-debug.log*
 # Testing
 coverage/
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+env/
+
+# Data
+*.csv
+*.xlsx
+!example_*.csv
+
 # IDE
 .vscode/
 .idea/
