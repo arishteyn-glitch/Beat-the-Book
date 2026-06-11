@@ -1,3 +1,27 @@
+# Dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+next-env.d.ts
+
+# Production
+build/
+dist/
+
+# Environment / secrets
+.env
+.env.local
+.env*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+
 # Python
 __pycache__/
 *.pyc
@@ -18,5 +42,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Environment
-.env
+# Misc
+*.tsbuildinfo

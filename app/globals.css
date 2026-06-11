@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --bg: #07090e;
+  --panel: #0d1117;
+  --panel-2: #11161f;
+  --border-c: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --muted-c: #8b93a7;
+}
+
+html.light {
+  color-scheme: light;
+  --bg: #eef0f4;
+  --panel: #ffffff;
+  --panel-2: #f1f3f7;
+  --border-c: rgba(15, 23, 42, 0.1);
+  --border-strong: rgba(15, 23, 42, 0.18);
+  --muted-c: #5b6472;
+}
+
+body {
+  @apply bg-background text-zinc-200 antialiased;
+}
+
+/* Light theme: remap the dark-tuned text utilities */
+html.light .text-zinc-50,
+html.light .text-zinc-100 {
+  color: #0f172a;
+}
+html.light .text-zinc-200 {
+  color: #1e293b;
+}
+html.light .text-zinc-300 {
+  color: #334155;
+}
+html.light .text-zinc-400 {
+  color: #475569;
+}
+html.light .bg-white\/8,
+html.light .bg-white\/5 {
+  background-color: rgba(15, 23, 42, 0.06);
+}
+html.light .text-blue-400 {
+  color: #2563eb;
+}
+
+/* Premium-terminal scrollbars */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+/* Tabular numerals everywhere stats appear */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Date input icon visibility on dark backgrounds */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.6);
+}
